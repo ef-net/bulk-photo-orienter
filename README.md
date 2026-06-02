@@ -7,10 +7,21 @@ macOS; no other dependencies.
 
 ## Download
 
-[PhotoOrienter.app (.zip)](https://github.com/ef-net/bulk-photo-orienter/raw/master/PhotoOrienter.app.zip) — macOS 14+
+[PhotoOrienter.app](https://github.com/ef-net/bulk-photo-orienter/raw/master/PhotoOrienter.app.zip) — macOS 14+
 
-Unzip, then right-click the app and choose Open the first time. The app is
-ad-hoc signed, so Gatekeeper prompts once.
+The app is ad-hoc signed, not notarized, so a downloaded copy is blocked by
+Gatekeeper on first launch. Clear it one of two ways:
+
+Option A — Terminal:
+
+```bash
+xattr -dr com.apple.quarantine /path/to/PhotoOrienter.app
+```
+
+Option B — System Settings: after the block appears, open System Settings →
+Privacy & Security and click Open Anyway.
+
+Building from source avoids this entirely.
 
 ## Detection
 
