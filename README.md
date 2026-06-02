@@ -28,8 +28,15 @@ Orientation is determined by an Apple Vision ensemble:
 - Scene classification
 - Horizon angle
 
-The signals are combined by weighted vote. A photo is left unchanged if no
-orientation scores clearly above the as-scanned one.
+Each detector's scores are normalised into a probability-like distribution (so
+a decisive detector outweighs an ambiguous one), combined by weighted vote, and
+passed through guards that keep a photo unchanged unless one orientation scores
+clearly above the as-scanned one.
+
+The detector weights are adjustable in the app (gear button → presets, or set
+each weight manually). Presets: **Default**, **Scene-first**, **Portrait &
+Events**, **Landscape & Architecture**, and **Balanced**. From the command line,
+pass `--wface`, `--wbody`, `--whorizon`, `--wscene`.
 
 Supported formats: JPEG, TIFF. PNG orientation-tag support varies by viewer.
 

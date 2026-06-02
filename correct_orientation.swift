@@ -8,15 +8,21 @@ import AppKit
 // MARK: - Orientation Detection
 //
 // Orientation is decided by an ENSEMBLE of Apple Vision signals, evaluated at
-// all four 90° orientations. Each detector votes; votes are normalised per
-// detector and combined with weights (geometry trusted most). The orientation
-// with the strongest combined vote wins — but only if it clearly beats the
-// as-scanned (0°) orientation, otherwise the image is left unchanged.
+// all four 90° orientations. Each detector produces a raw score per orientation;
+// scores are normalised per detector into a probability-like distribution (so a
+// decisive detector outweighs an ambiguous one), combined with user-tunable
+// weights, then passed through a sequence of guards before any rotation is made.
 //
 //   • Face landmarks  — per-face roll; cos(roll) peaks for upright faces.
 //   • Human body pose — head-above-hips geometry.
 //   • Scene classifier— trained on upright images, so it scores highest there.
 //   • Horizon         — detected horizon is most level when upright.
+//
+// Note on horizon: a level line is level at both 0°/180° and vertical at both
+// 90°/270°, so horizon only resolves the *axis* (portrait vs landscape), never
+// which of the two flips is upright. The flip is resolved by scene/geometry.
+
+// MARK: Model
 
 /// The orientation that, when applied to the image, makes it upright.
 struct Correction {
@@ -26,6 +32,41 @@ struct Correction {
 
 enum Confidence { case low, high }
 
+/// Result of a detection: the correction to apply and how sure we are.
+struct Decision {
+    let correction: Correction
+    let confidence: Confidence
+}
+
+/// Relative trust assigned to each detector. Overridable at runtime so the GUI
+/// can pass user-selected presets via --wface/--wbody/--whorizon/--wscene.
+struct DetectorWeights {
+    var face: Double
+    var body: Double
+    var horizon: Double
+    var scene: Double
+
+    var total: Double { face + body + horizon + scene }
+
+    static let defaults = DetectorWeights(face: 3.0, body: 2.0, horizon: 2.0, scene: 0.3)
+}
+
+/// Detection tunables grouped in one place. The margins are ratios, so they are
+/// independent of the chosen weights; the gates that compare against absolute
+/// scores are expressed relative to the weight budget so they hold for any preset.
+private enum Tuning {
+    static let minFaceConfidence    = 0.3    // discard weak/spurious face detections
+    static let minFaceAreaFraction  = 0.005  // discard tiny faces (group shots, background)
+    static let minBodyConfidence    = 0.1    // minimum keypoint confidence
+    static let chanceLevel          = 0.25   // uniform prob across 4 orientations
+    static let weakSignalMargin     = 1.30   // winner must beat the no-info baseline by 30%
+    static let asScannedMargin      = 1.15   // winner must beat as-scanned (0°) by 15%
+    static let noGeometryBoost       = 0.85  // extra as-scanned margin when no face/body present
+    static let axisMargin           = 1.10   // winning axis must beat the cross axis by 10%
+    static let flipMargin           = 1.005  // winning flip must beat its 180° partner (thin: any real signal commits)
+    static let highConfidenceRatio  = 2.0    // best ÷ runner-up ≥ this → high confidence
+}
+
 private let candidates: [(Correction, Int)] = [
     (Correction(orientation: .up,    label: "0° (already upright)"), 0),
     (Correction(orientation: .right, label: "90° clockwise"),        90),
@@ -33,19 +74,80 @@ private let candidates: [(Correction, Int)] = [
     (Correction(orientation: .left,  label: "90° counter-clockwise"),270),
 ]
 
-// Detector weights — defaults; overridden at runtime by --wface/--wbody/
-// --whorizon/--wscene args so the GUI can pass user-selected presets.
-private var wFace = 3.0, wBody = 2.0, wHorizon = 2.0, wScene = 0.3
-
-// Minimum margin the winner must beat the as-scanned (0°) score by before we
-// rotate. Keeps ambiguous photos unchanged rather than guessing wrong.
-private let rotateMargin = 1.15
-
 private let ansiGreen  = "\u{001B}[32m"
 private let ansiYellow = "\u{001B}[33m"
 private let ansiReset  = "\u{001B}[0m"
 
-func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
+// MARK: Per-detector scoring
+//
+// Each function reduces one detector's results at one orientation to a single
+// scalar. All use `max` (best single subject) rather than `sum`, so a crowd of
+// weak detections cannot outvote one strong one.
+
+/// Best face score: confidence × cos(roll). Upright faces (roll≈0) score ~1.
+/// Faces without roll data, below confidence, or too small are ignored.
+private func faceScore(_ faces: [VNFaceObservation]?) -> Double {
+    guard let faces else { return 0 }
+    return faces.compactMap { f -> Double? in
+        guard f.confidence > Float(Tuning.minFaceConfidence), let roll = f.roll else { return nil }
+        guard f.boundingBox.width * f.boundingBox.height > Tuning.minFaceAreaFraction else { return nil }
+        return Double(f.confidence) * max(0, cos(roll.doubleValue))
+    }.max() ?? 0
+}
+
+/// Best body score: reward the clearest person whose head sits above their
+/// pelvis (y is up). Score = min(nose, root) confidence × vertical distance.
+private func bodyScore(_ people: [VNHumanBodyPoseObservation]?) -> Double {
+    guard let people else { return 0 }
+    return people.compactMap { p -> Double? in
+        guard let nose = try? p.recognizedPoint(.nose),
+              let root = try? p.recognizedPoint(.root),
+              nose.confidence > Float(Tuning.minBodyConfidence),
+              root.confidence > Float(Tuning.minBodyConfidence) else { return nil }
+        let dy = Double(nose.location.y - root.location.y)
+        return dy > 0 ? Double(min(nose.confidence, root.confidence)) * dy : nil
+    }.max() ?? 0
+}
+
+/// Sum of the top classification confidences (highest when upright).
+private func sceneScore(_ classes: [VNClassificationObservation]?) -> Double {
+    guard let classes else { return 0 }
+    return classes.sorted { $0.confidence > $1.confidence }
+        .prefix(5)
+        .reduce(0.0) { $0 + Double($1.confidence) }
+}
+
+/// Most level (|angle|→0) scores highest.
+private func horizonScore(_ horizon: VNHorizonObservation?) -> Double {
+    guard let horizon else { return 0 }
+    return 1.0 / (1.0 + abs(Double(horizon.angle)))
+}
+
+// MARK: Combination & decision
+
+/// Normalise a detector's per-orientation scores into a probability-like
+/// distribution (divide by sum). This preserves "peakiness": a detector that
+/// strongly favours one orientation contributes a high value, while one that is
+/// nearly flat across orientations contributes little — unlike divide-by-max,
+/// which makes every detector's winner look equally decisive.
+private func normalizedBySum(_ d: [Int: Double]) -> [Int: Double] {
+    let sum = d.values.reduce(0, +)
+    guard sum > 0 else { return [:] }
+    return d.mapValues { $0 / sum }
+}
+
+/// Second-highest value in the totals, for confidence and tie comparisons.
+private func runnerUp(of totals: [Int: Double]) -> Double {
+    let sorted = totals.values.sorted(by: >)
+    return sorted.count > 1 ? sorted[1] : 0
+}
+
+private func confidence(best: Double, totals: [Int: Double]) -> Confidence {
+    let second = runnerUp(of: totals)
+    return second > 0 && best / second >= Tuning.highConfidenceRatio ? .high : .low
+}
+
+func detectCorrection(for cgImage: CGImage, weights: DetectorWeights) -> Decision? {
     var face = [Int: Double]()
     var body = [Int: Double]()
     var scene = [Int: Double]()
@@ -61,96 +163,84 @@ func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: correction.orientation)
         try? handler.perform([faceReq, bodyReq, sceneReq, horizonReq])
 
-        // FACE: best single face score (confidence × cos(roll)).
-        // Requires roll data and minimum confidence so partially-obscured faces,
-        // back-turned subjects, and piles of small group-shot faces don't corrupt
-        // the vote. Using max (not sum) means one good face counts once.
-        if let faces = faceReq.results {
-            face[degrees] = faces.compactMap { f -> Double? in
-                guard f.confidence > 0.3, let roll = f.roll else { return nil }
-                // Ignore tiny faces (wide-angle group shots, background faces).
-                // Bounding box is normalised [0,1]; 0.5% of image area filters
-                // faces smaller than ~1/15th of image width on a side.
-                let area = f.boundingBox.width * f.boundingBox.height
-                guard area > 0.005 else { return nil }
-                return Double(f.confidence) * max(0, cos(roll.doubleValue))
-            }.max() ?? 0
-        }
-
-        // BODY: reward people whose head sits above their pelvis (y is up).
-        if let people = bodyReq.results {
-            body[degrees] = people.reduce(0.0) { acc, p in
-                guard let nose = try? p.recognizedPoint(.nose),
-                      let root = try? p.recognizedPoint(.root),
-                      nose.confidence > 0.1, root.confidence > 0.1 else { return acc }
-                let dy = Double(nose.location.y - root.location.y)
-                return dy > 0 ? acc + Double(min(nose.confidence, root.confidence)) * dy : acc
-            }
-        }
-
-        // SCENE: sum of the top classification confidences (highest upright).
-        if let cls = sceneReq.results {
-            scene[degrees] = cls.sorted { $0.confidence > $1.confidence }
-                .prefix(5)
-                .reduce(0.0) { $0 + Double($1.confidence) }
-        }
-
-        // HORIZON: most level (|angle|→0) when upright.
-        if let h = horizonReq.results?.first {
-            horizon[degrees] = 1.0 / (1.0 + abs(Double(h.angle)))
-        }
+        face[degrees]    = faceScore(faceReq.results)
+        body[degrees]    = bodyScore(bodyReq.results)
+        scene[degrees]   = sceneScore(sceneReq.results)
+        horizon[degrees] = horizonScore(horizonReq.results?.first)
     }
 
-    // Normalise each detector across orientations to [0,1] so weights compare.
-    func norm(_ d: [Int: Double]) -> [Int: Double] {
-        guard let m = d.values.max(), m > 0 else { return [:] }
-        return d.mapValues { $0 / m }
-    }
-    let nf = norm(face), nb = norm(body), ns = norm(scene), nh = norm(horizon)
+    let nf = normalizedBySum(face), nb = normalizedBySum(body)
+    let ns = normalizedBySum(scene), nh = normalizedBySum(horizon)
 
-    var total = [Int: Double]()
+    var totals = [Int: Double]()
     for (_, degrees) in candidates {
-        total[degrees] = wFace * (nf[degrees] ?? 0) + wBody * (nb[degrees] ?? 0)
-                       + wScene * (ns[degrees] ?? 0) + wHorizon * (nh[degrees] ?? 0)
+        totals[degrees] = weights.face * (nf[degrees] ?? 0) + weights.body * (nb[degrees] ?? 0)
+                        + weights.scene * (ns[degrees] ?? 0) + weights.horizon * (nh[degrees] ?? 0)
     }
 
-    guard let best = total.max(by: { $0.value < $1.value }), best.value > 0 else {
+    // The no-information baseline scales with which detectors actually produced
+    // a signal: each contributes `chanceLevel × weight` if it fired at all.
+    let firedBudget =
+        (face.values.contains    { $0 > 0 } ? weights.face    : 0) +
+        (body.values.contains    { $0 > 0 } ? weights.body    : 0) +
+        (scene.values.contains   { $0 > 0 } ? weights.scene   : 0) +
+        (horizon.values.contains { $0 > 0 } ? weights.horizon : 0)
+
+    return decide(totals: totals, face: face, body: body,
+                  firedBudget: firedBudget, weights: weights)
+}
+
+/// Apply the guard sequence to the combined scores and return what to do.
+private func decide(totals: [Int: Double],
+                    face: [Int: Double], body: [Int: Double],
+                    firedBudget: Double,
+                    weights: DetectorWeights) -> Decision? {
+    guard let best = totals.max(by: { $0.value < $1.value }), best.value > 0 else {
         return nil  // nothing detected at all
     }
+    let keepAsScanned = Decision(correction: candidates[0].0, confidence: .low)
 
-    // Weak-signal gate: require at least one detector to register meaningfully.
-    guard best.value >= 1.5 else { return (candidates[0].0, .low) }
+    // Weak-signal gate: the winner must clear the no-information baseline
+    // (every fired detector voting uniformly) by a margin.
+    let baseline = Tuning.chanceLevel * firedBudget
+    guard best.value >= baseline * Tuning.weakSignalMargin else { return keepAsScanned }
 
-    // When geometry (face/body) is absent, non-geometry signals carry less
-    // certainty. Scale the required margin by how much of the weight budget
-    // is assigned to geometry vs scene/horizon, so the threshold stays
-    // sensible across any user-selected weight configuration.
+    // Already upright — nothing to do.
+    guard best.key != 0 else {
+        return Decision(correction: candidates[0].0,
+                        confidence: confidence(best: best.value, totals: totals))
+    }
+
+    // Ambiguity guard: the winner must clearly beat the as-scanned (0°) score.
+    // When no geometry (face/body) is present, scene+horizon carry less
+    // certainty, so require a larger margin — scaled by the geometry share of
+    // the weight budget so it stays sensible for any preset.
     let hasGeometry = face.values.contains { $0 > 0 } || body.values.contains { $0 > 0 }
-    let effectiveMargin: Double
-    if hasGeometry {
-        effectiveMargin = rotateMargin
-    } else {
-        let geomShare = (wFace + wBody) / max(wFace + wBody + wHorizon + wScene, 0.001)
-        effectiveMargin = rotateMargin + geomShare * 0.85
+    let geomShare = (weights.face + weights.body) / max(weights.total, 0.001)
+    let asScannedMargin = hasGeometry
+        ? Tuning.asScannedMargin
+        : Tuning.asScannedMargin + geomShare * Tuning.noGeometryBoost
+    if best.value <= (totals[0] ?? 0) * asScannedMargin { return keepAsScanned }
+
+    // Axis vs flip. Horizon scores the two flip-partners equally (it only sees
+    // the axis), so we decide in two stages:
+    //   1. Is the winning axis clearly better than the cross axis? If not, the
+    //      orientation is genuinely ambiguous → keep as-scanned.
+    //   2. Within the axis, the flip is resolved only by scene/geometry. Commit
+    //      to the higher-scoring flip; bail only if its partner is an exact tie
+    //      (no signal able to separate the two horizon-equal flips).
+    let partner = (best.key + 180) % 360
+    let crossAxisMax = totals.filter { $0.key != best.key && $0.key != partner }.values.max() ?? 0
+    if crossAxisMax > 0 && best.value <= crossAxisMax * Tuning.axisMargin {
+        return keepAsScanned  // axis unclear
+    }
+    let partnerScore = totals[partner] ?? 0
+    if partnerScore > 0 && best.value <= partnerScore * Tuning.flipMargin {
+        return keepAsScanned  // can't resolve which flip is upright
     }
 
-    // Ambiguity guard: keep as-scanned unless the winner clearly wins.
-    if best.key != 0 && best.value <= (total[0] ?? 0) * effectiveMargin {
-        return (candidates[0].0, .low)
-    }
-
-    // Direction guard: winner must clearly beat the next-best rotation so we
-    // don't flip to a wrong direction when two rotations are nearly tied.
-    if best.key != 0 {
-        let competingMax = total.filter { $0.key != best.key && $0.key != 0 }.values.max() ?? 0
-        if competingMax > 0 && best.value <= competingMax * 1.10 {
-            return (candidates[0].0, .low)
-        }
-    }
-
-    let secondBest = total.filter { $0.key != best.key }.values.max() ?? 0
-    let confidence: Confidence = secondBest > 0 && best.value / secondBest >= 2.0 ? .high : .low
-    return (candidates.first { $0.1 == best.key }!.0, confidence)
+    return Decision(correction: candidates.first { $0.1 == best.key }!.0,
+                    confidence: confidence(best: best.value, totals: totals))
 }
 
 // MARK: - Orientation Metadata (lossless)
@@ -259,7 +349,7 @@ func detectionImage(for url: URL, maxPixels: Int = 1600) -> CGImage? {
     return CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary)
 }
 
-func processImage(at url: URL, dryRun: Bool) -> ProcessResult {
+func processImage(at url: URL, weights: DetectorWeights, dryRun: Bool) -> ProcessResult {
     guard let cgImage = detectionImage(for: url) else {
         print("  ⚠️  Could not load: \(url.lastPathComponent)")
         return .loadFailed
@@ -268,25 +358,25 @@ func processImage(at url: URL, dryRun: Bool) -> ProcessResult {
     print("  Analysing \(url.lastPathComponent)…", terminator: "")
     fflush(stdout)
 
-    guard let (correction, confidence) = detectCorrection(for: cgImage) else {
+    guard let decision = detectCorrection(for: cgImage, weights: weights) else {
         print(" inconclusive — left unchanged")
         return .inconclusive
     }
 
-    let confidenceTag = confidence == .high
+    let confidenceTag = decision.confidence == .high
         ? " \(ansiGreen)[high confidence]\(ansiReset)"
         : " \(ansiYellow)[low confidence]\(ansiReset)"
 
-    guard correction.orientation != .up else {
+    guard decision.correction.orientation != .up else {
         print(" already upright\(confidenceTag)")
         return .upright
     }
 
-    print(" rotating \(correction.label)\(confidenceTag)")
+    print(" rotating \(decision.correction.label)\(confidenceTag)")
 
     // Map the correction to its statistic category.
     let rotationResult: ProcessResult
-    switch correction.orientation {
+    switch decision.correction.orientation {
     case .right: rotationResult = .rotated90CW
     case .left:  rotationResult = .rotated90CCW
     case .down:  rotationResult = .rotated180
@@ -296,7 +386,7 @@ func processImage(at url: URL, dryRun: Bool) -> ProcessResult {
     if dryRun { return rotationResult }
 
     // Compose with any existing tag, then write metadata only (lossless).
-    let finalOrientation = compose(fileOrientation(url), correction.orientation)
+    let finalOrientation = compose(fileOrientation(url), decision.correction.orientation)
     if setOrientationLossless(url: url, orientation: finalOrientation) {
         print("  ✓  Tagged \(url.lastPathComponent) (lossless, no recompression)")
         return rotationResult
@@ -319,10 +409,12 @@ func argDouble(_ flag: String, _ defaultVal: Double) -> Double {
     guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return defaultVal }
     return Double(args[i + 1]) ?? defaultVal
 }
-wFace    = argDouble("--wface",    wFace)
-wBody    = argDouble("--wbody",    wBody)
-wHorizon = argDouble("--whorizon", wHorizon)
-wScene   = argDouble("--wscene",   wScene)
+let weights = DetectorWeights(
+    face:    argDouble("--wface",    DetectorWeights.defaults.face),
+    body:    argDouble("--wbody",    DetectorWeights.defaults.body),
+    horizon: argDouble("--whorizon", DetectorWeights.defaults.horizon),
+    scene:   argDouble("--wscene",   DetectorWeights.defaults.scene)
+)
 
 guard let dirArg = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
     print("""
@@ -330,10 +422,10 @@ guard let dirArg = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
 
       <directory>        Folder of scanned photos to correct
       --dry-run          Detect only, do not write changes
-      --wface    <n>     Face landmark weight   (default 3.0)
-      --wbody    <n>     Body pose weight       (default 2.0)
-      --whorizon <n>     Horizon weight         (default 2.0)
-      --wscene   <n>     Scene classifier weight(default 0.3)
+      --wface    <n>     Face landmark weight    (default 3.0)
+      --wbody    <n>     Body pose weight        (default 2.0)
+      --whorizon <n>     Horizon weight          (default 2.0)
+      --wscene   <n>     Scene classifier weight (default 0.3)
 
     Orientation is detected by an Apple Vision ensemble (faces, body pose,
     scene, horizon). Correction is written as an EXIF orientation tag only —
@@ -367,7 +459,7 @@ if imageURLs.isEmpty {
 }
 
 let weightLabel = String(format: "face %.1f · body %.1f · horizon %.1f · scene %.1f",
-                         wFace, wBody, wHorizon, wScene)
+                         weights.face, weights.body, weights.horizon, weights.scene)
 print("\(dryRun ? "[DRY RUN] " : "")Processing \(imageURLs.count) image(s) in \(dirURL.path)")
 print("  Weights: \(weightLabel)\n")
 
@@ -384,7 +476,7 @@ for url in imageURLs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
     // iteration. Without this, autoreleased objects accumulate across the
     // whole run and the process gets OOM-killed after ~1500–2000 images.
     autoreleasepool {
-        let result = processImage(at: url, dryRun: dryRun)
+        let result = processImage(at: url, weights: weights, dryRun: dryRun)
         tally[result, default: 0] += 1
     }
     done += 1
