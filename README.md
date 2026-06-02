@@ -33,6 +33,8 @@ orientation scores clearly above the as-scanned one.
 
 Supported formats: JPEG, TIFF. PNG orientation-tag support varies by viewer.
 
+Tested with bulk image output from the Epson FF-680W scanner.
+
 ## Requirements
 
 - macOS 14 or later
