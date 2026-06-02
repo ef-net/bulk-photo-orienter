@@ -2,7 +2,53 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-// MARK: - Model
+// MARK: - Weight Presets
+
+struct WeightPreset: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let description: String
+    let face: Double
+    let body: Double
+    let horizon: Double
+    let scene: Double
+
+    func matches(face f: Double, body b: Double, horizon h: Double, scene s: Double) -> Bool {
+        f == face && b == body && h == horizon && s == scene
+    }
+
+    static let all: [WeightPreset] = [
+        WeightPreset(
+            id: "default", name: "Default",
+            description: "Face geometry is the primary signal. Best for mixed photo collections with people.",
+            face: 3.0, body: 2.0, horizon: 2.0, scene: 0.3
+        ),
+        WeightPreset(
+            id: "scene", name: "Scene-first",
+            description: "Scene classification and body pose lead. Tested variant — worked better on several edge cases.",
+            face: 2.0, body: 2.5, horizon: 0.5, scene: 3.0
+        ),
+        WeightPreset(
+            id: "portrait", name: "Portrait & Events",
+            description: "Maximizes face and body geometry. Best for portrait sessions, events, and weddings.",
+            face: 3.5, body: 3.0, horizon: 0.5, scene: 0.3
+        ),
+        WeightPreset(
+            id: "landscape", name: "Landscape & Architecture",
+            description: "Horizon and scene classification dominate. Best for travel and architectural photos with few or no people.",
+            face: 0.5, body: 0.5, horizon: 3.5, scene: 1.5
+        ),
+        WeightPreset(
+            id: "balanced", name: "Balanced",
+            description: "Equal trust across all four detectors. Good starting point for unknown or mixed collections.",
+            face: 2.0, body: 2.0, horizon: 2.0, scene: 2.0
+        ),
+    ]
+
+    static let `default` = all[0]
+}
+
+// MARK: - Log Line
 
 /// One line of console output, with a semantic style for colouring.
 struct LogLine: Identifiable {
@@ -47,7 +93,6 @@ struct LogLine: Identifiable {
         return LogLine(text: plain, kind: kind, attributed: attributed)
     }
 
-    // Strip ESC[Xm sequences, leaving only printable text.
     private static func stripANSI(_ s: String) -> String {
         var out = "", i = s.startIndex
         while i < s.endIndex {
@@ -61,8 +106,6 @@ struct LogLine: Identifiable {
         return out
     }
 
-    // Build an AttributedString, mapping ANSI colour codes to SwiftUI Colors.
-    // Non-coloured segments use `defaultColor` (the line's semantic kind colour).
     private static func buildAttributed(_ raw: String, defaultColor: Color) -> AttributedString {
         let ansiGreen  = Color(red: 0.40, green: 0.85, blue: 0.45)
         let ansiYellow = Color(red: 0.95, green: 0.78, blue: 0.30)
@@ -94,7 +137,8 @@ struct LogLine: Identifiable {
     }
 }
 
-/// Parsed end-of-run statistics from the engine's @@STATS line.
+// MARK: - Run Stats
+
 struct RunStats {
     var elapsedText = "—"
     var processed = 0
@@ -126,26 +170,62 @@ final class Runner: ObservableObject {
     @Published var lines: [LogLine] = []
     @Published var stats: RunStats?
     @Published var savedLogPath: String?
-    @Published var total = 0      // images to process (0 = unknown yet)
-    @Published var done = 0       // images completed so far
+    @Published var total = 0
+    @Published var done = 0
     @Published var elapsed: TimeInterval = 0
+
+    // Detection weights — persisted to UserDefaults.
+    @Published var wFace:    Double
+    @Published var wBody:    Double
+    @Published var wHorizon: Double
+    @Published var wScene:   Double
+
+    init() {
+        let ud = UserDefaults.standard
+        wFace    = ud.object(forKey: "wFace")    .flatMap { $0 as? Double } ?? WeightPreset.default.face
+        wBody    = ud.object(forKey: "wBody")    .flatMap { $0 as? Double } ?? WeightPreset.default.body
+        wHorizon = ud.object(forKey: "wHorizon") .flatMap { $0 as? Double } ?? WeightPreset.default.horizon
+        wScene   = ud.object(forKey: "wScene")   .flatMap { $0 as? Double } ?? WeightPreset.default.scene
+    }
+
+    func saveWeights() {
+        let ud = UserDefaults.standard
+        ud.set(wFace,    forKey: "wFace")
+        ud.set(wBody,    forKey: "wBody")
+        ud.set(wHorizon, forKey: "wHorizon")
+        ud.set(wScene,   forKey: "wScene")
+    }
+
+    func applyPreset(_ preset: WeightPreset) {
+        wFace = preset.face; wBody = preset.body
+        wHorizon = preset.horizon; wScene = preset.scene
+        saveWeights()
+    }
+
+    var activePreset: WeightPreset? {
+        WeightPreset.all.first { $0.matches(face: wFace, body: wBody, horizon: wHorizon, scene: wScene) }
+    }
+
+    var presetLabel: String { activePreset?.name ?? "Custom" }
+
+    var weightSummary: String {
+        String(format: "face %.1f · body %.1f · horizon %.1f · scene %.1f",
+               wFace, wBody, wHorizon, wScene)
+    }
 
     private var startDate: Date?
     private var ticker: Timer?
 
-    /// Fraction complete, or nil while the total is still unknown.
     var progress: Double? {
         guard total > 0 else { return nil }
         return min(1.0, Double(done) / Double(total))
     }
 
-    /// Projected total run time = elapsed ÷ fraction done.
     var estimatedTotal: TimeInterval? {
         guard let p = progress, p > 0.02 else { return nil }
         return elapsed / p
     }
 
-    /// "MM:SS / MM:SS" — elapsed over projected total.
     var clockText: String {
         "\(Runner.clock(elapsed)) / \(estimatedTotal.map(Runner.clock) ?? "--:--")"
     }
@@ -158,7 +238,7 @@ final class Runner: ObservableObject {
     }
 
     private var process: Process?
-    private var rawLog = ""  // full captured output, written to the log file
+    private var rawLog = ""
 
     var canStart: Bool { folderURL != nil && !isRunning }
 
@@ -172,8 +252,6 @@ final class Runner: ObservableObject {
         if panel.runModal() == .OK { folderURL = panel.url }
     }
 
-    /// Locate the bundled engine binary (Resources), falling back to the
-    /// app's own directory for development runs.
     private func engineURL() -> URL? {
         if let u = Bundle.main.url(forResource: "correct_orientation", withExtension: nil) { return u }
         let exeDir = Bundle.main.bundleURL.deletingLastPathComponent()
@@ -199,7 +277,11 @@ final class Runner: ObservableObject {
 
         let proc = Process()
         proc.executableURL = engine
-        var argv = [folder.path, "--emit-stats"]
+        var argv = [folder.path, "--emit-stats",
+                    "--wface",    String(format: "%.2f", wFace),
+                    "--wbody",    String(format: "%.2f", wBody),
+                    "--whorizon", String(format: "%.2f", wHorizon),
+                    "--wscene",   String(format: "%.2f", wScene)]
         if dryRun { argv.append("--dry-run") }
         proc.arguments = argv
 
@@ -227,11 +309,9 @@ final class Runner: ObservableObject {
         }
     }
 
-    func cancel() {
-        process?.terminate()
-    }
+    func cancel() { process?.terminate() }
 
-    // MARK: streaming
+    // MARK: Streaming
 
     private var partial = ""
 
@@ -245,7 +325,6 @@ final class Runner: ObservableObject {
     }
 
     private func handle(line: String) {
-        // Intercept machine-readable markers; none of these are shown.
         if line.hasPrefix("@@STATS ") {
             stats = RunStats(json: String(line.dropFirst("@@STATS ".count)))
             return
@@ -270,7 +349,6 @@ final class Runner: ObservableObject {
     }
 
     private func finish() {
-        // Drain any trailing partial line.
         if !partial.isEmpty { handle(line: partial); partial = "" }
         process?.standardOutput.map { ($0 as? Pipe)?.fileHandleForReading.readabilityHandler = nil }
         ticker?.invalidate(); ticker = nil
@@ -287,9 +365,10 @@ final class Runner: ObservableObject {
         let url = folder.appendingPathComponent(name)
 
         var contents = "Photo Orientation Correction — Log\n"
-        contents += "Folder: \(folder.path)\n"
-        contents += "Date:   \(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .medium))\n"
-        contents += "Mode:   \(dryRun ? "Dry run (no files changed)" : "Apply corrections")\n"
+        contents += "Folder:  \(folder.path)\n"
+        contents += "Date:    \(DateFormatter.localizedString(from: Date(), dateStyle: .medium, timeStyle: .medium))\n"
+        contents += "Mode:    \(dryRun ? "Dry run (no files changed)" : "Apply corrections")\n"
+        contents += "Weights: \(presetLabel) — \(weightSummary)\n"
         contents += String(repeating: "=", count: 48) + "\n\n"
         contents += rawLog
 
@@ -303,7 +382,7 @@ final class Runner: ObservableObject {
     }
 }
 
-// MARK: - Views
+// MARK: - App & Root View
 
 @main
 struct PhotoOrienterApp: App {
@@ -318,17 +397,20 @@ struct PhotoOrienterApp: App {
 
 struct ContentView: View {
     @StateObject private var runner = Runner()
+    @State private var showSettings = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            controls
-                .padding(20)
+            controls.padding(20)
             console
             if let s = runner.stats { statsBar(s) }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet(runner: runner)
+        }
         .onAppear {
             NSApp.setActivationPolicy(.regular)
             NSApp.activate(ignoringOtherApps: true)
@@ -336,9 +418,6 @@ struct ContentView: View {
         }
     }
 
-    /// Optional: launch with a folder path to preselect and start
-    /// automatically — e.g. `open PhotoOrienter.app --args /path/to/photos`.
-    /// Add `--dry-run` to preview.
     private func autoRunIfRequested() {
         let args = Array(CommandLine.arguments.dropFirst())
         guard let dir = args.first(where: { !$0.hasPrefix("-") }) else { return }
@@ -349,7 +428,8 @@ struct ContentView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { runner.start() }
     }
 
-    // Header ---------------------------------------------------------------
+    // MARK: Header
+
     private var header: some View {
         HStack(spacing: 14) {
             Image(systemName: "photo.on.rectangle.angled")
@@ -361,16 +441,25 @@ struct ContentView: View {
                     .font(.system(size: 12)).foregroundStyle(.secondary)
             }
             Spacer()
+            Button {
+                showSettings = true
+            } label: {
+                Label(runner.presetLabel, systemImage: "slider.horizontal.3")
+                    .font(.system(size: 12))
+            }
+            .buttonStyle(.bordered)
+            .disabled(runner.isRunning)
+            .help("Detection weights: \(runner.weightSummary)")
         }
         .padding(.horizontal, 20).padding(.vertical, 16)
     }
 
-    // Controls -------------------------------------------------------------
+    // MARK: Controls
+
     private var controls: some View {
         VStack(spacing: 14) {
             HStack(spacing: 12) {
-                Image(systemName: "folder")
-                    .foregroundStyle(.secondary)
+                Image(systemName: "folder").foregroundStyle(.secondary)
                 Text(runner.folderURL?.path ?? "No folder selected")
                     .font(.system(size: 13, design: .rounded))
                     .foregroundStyle(runner.folderURL == nil ? .secondary : .primary)
@@ -384,14 +473,10 @@ struct ContentView: View {
 
             HStack {
                 Toggle(isOn: $runner.dryRun) {
-                    Text("Dry run — preview only, don't modify files")
-                        .font(.system(size: 12))
+                    Text("Dry run — preview only, don't modify files").font(.system(size: 12))
                 }
-                .toggleStyle(.switch)
-                .disabled(runner.isRunning)
-
+                .toggleStyle(.switch).disabled(runner.isRunning)
                 Spacer()
-
                 if runner.isRunning {
                     Button(role: .destructive) { runner.cancel() } label: {
                         Label("Stop", systemImage: "stop.fill")
@@ -399,11 +484,9 @@ struct ContentView: View {
                 } else {
                     Button { runner.start() } label: {
                         Label(runner.dryRun ? "Preview" : "Correct Photos",
-                              systemImage: "wand.and.stars")
-                            .frame(minWidth: 130)
+                              systemImage: "wand.and.stars").frame(minWidth: 130)
                     }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.large)
+                    .buttonStyle(.borderedProminent).controlSize(.large)
                     .disabled(!runner.canStart)
                 }
             }
@@ -412,30 +495,30 @@ struct ContentView: View {
         }
     }
 
-    // Live progress --------------------------------------------------------
+    // MARK: Progress
+
     private var progressBar: some View {
         VStack(spacing: 5) {
             if let p = runner.progress {
                 ProgressView(value: p).progressViewStyle(.linear)
             } else {
-                ProgressView().progressViewStyle(.linear)  // indeterminate
+                ProgressView().progressViewStyle(.linear)
             }
             HStack {
-                Text(runner.total > 0 ? "\(runner.done) of \(runner.total) images"
-                                      : "Scanning folder…")
+                Text(runner.total > 0 ? "\(runner.done) of \(runner.total) images" : "Scanning folder…")
                 if let p = runner.progress {
                     Text("· \(Int(p * 100))%").foregroundStyle(.tertiary)
                 }
                 Spacer()
                 Text(runner.clockText).monospacedDigit()
             }
-            .font(.system(size: 11, design: .rounded))
-            .foregroundStyle(.secondary)
+            .font(.system(size: 11, design: .rounded)).foregroundStyle(.secondary)
         }
         .transition(.opacity)
     }
 
-    // Console --------------------------------------------------------------
+    // MARK: Console
+
     private var console: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -466,7 +549,8 @@ struct ContentView: View {
         }
     }
 
-    // Stats bar ------------------------------------------------------------
+    // MARK: Stats Bar
+
     private func statsBar(_ s: RunStats) -> some View {
         VStack(spacing: 10) {
             Divider()
@@ -510,6 +594,161 @@ struct ContentView: View {
                 Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Text(value).font(.system(size: 17, weight: .semibold, design: .rounded))
+        }
+    }
+}
+
+// MARK: - Settings Sheet
+
+struct SettingsSheet: View {
+    @ObservedObject var runner: Runner
+    @Environment(\.dismiss) private var dismiss
+
+    // Local copies so changes only commit on Done.
+    @State private var face:    Double
+    @State private var body_:   Double   // 'body' is a reserved word in SwiftUI
+    @State private var horizon: Double
+    @State private var scene:   Double
+
+    init(runner: Runner) {
+        self.runner = runner
+        _face    = State(initialValue: runner.wFace)
+        _body_   = State(initialValue: runner.wBody)
+        _horizon = State(initialValue: runner.wHorizon)
+        _scene   = State(initialValue: runner.wScene)
+    }
+
+    private var selectedPresetID: String {
+        WeightPreset.all.first {
+            $0.matches(face: face, body: body_, horizon: horizon, scene: scene)
+        }?.id ?? "custom"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+
+            // Title bar
+            HStack {
+                Text("Detection Weights")
+                    .font(.system(size: 15, weight: .semibold))
+                Spacer()
+                Button { dismiss() } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.borderless)
+            }
+            .padding([.horizontal, .top], 20)
+            .padding(.bottom, 16)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+
+                    // Preset picker
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("PRESET")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Picker("", selection: presetBinding) {
+                            ForEach(WeightPreset.all) { p in
+                                Text(p.name).tag(p.id)
+                            }
+                            Divider()
+                            Text("Custom").tag("custom")
+                        }
+                        .labelsHidden()
+                        .pickerStyle(.menu)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        if let desc = WeightPreset.all.first(where: { $0.id == selectedPresetID })?.description {
+                            Text(desc)
+                                .font(.system(size: 12))
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+
+                    Divider()
+
+                    // Weight sliders
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("WEIGHTS")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        WeightRow(label: "Face Landmarks",  value: $face)
+                        WeightRow(label: "Body Pose",       value: $body_)
+                        WeightRow(label: "Horizon",         value: $horizon)
+                        WeightRow(label: "Scene Classifier",value: $scene)
+                    }
+
+                    Text("Higher values give that detector more influence. Changes take effect on the next run.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(20)
+            }
+
+            Divider()
+
+            // Action buttons
+            HStack {
+                Button("Reset to Default") {
+                    let d = WeightPreset.default
+                    face = d.face; body_ = d.body; horizon = d.horizon; scene = d.scene
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") { dismiss() }
+                Button("Apply") {
+                    runner.wFace    = face
+                    runner.wBody    = body_
+                    runner.wHorizon = horizon
+                    runner.wScene   = scene
+                    runner.saveWeights()
+                    dismiss()
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(20)
+        }
+        .frame(width: 460)
+    }
+
+    private var presetBinding: Binding<String> {
+        Binding(
+            get: { selectedPresetID },
+            set: { id in
+                if let p = WeightPreset.all.first(where: { $0.id == id }) {
+                    face = p.face; body_ = p.body; horizon = p.horizon; scene = p.scene
+                }
+            }
+        )
+    }
+}
+
+// MARK: - Weight Row
+
+struct WeightRow: View {
+    let label: String
+    @Binding var value: Double
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(label)
+                .frame(width: 150, alignment: .leading)
+                .font(.system(size: 13))
+            Slider(value: $value, in: 0...5, step: 0.5)
+            TextField("", value: $value, format: .number.precision(.fractionLength(1)))
+                .frame(width: 44)
+                .multilineTextAlignment(.center)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+                .onSubmit { value = min(max(value, 0), 5) }
         }
     }
 }

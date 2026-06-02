@@ -33,12 +33,9 @@ private let candidates: [(Correction, Int)] = [
     (Correction(orientation: .left,  label: "90° counter-clockwise"),270),
 ]
 
-// Detector weights (relative trust). Geometry > scene/horizon.
-// Horizon is physics-based (gravity/level-line detection) and directly
-// measures orientation — weighted higher than the scene classifier, which
-// is a semantic model trained on upright images and is unreliable for
-// orientation decisions on landscapes, groups, and ambiguous content.
-private let wFace = 3.0, wBody = 2.0, wHorizon = 2.0, wScene = 0.3
+// Detector weights — defaults; overridden at runtime by --wface/--wbody/
+// --whorizon/--wscene args so the GUI can pass user-selected presets.
+private var wFace = 3.0, wBody = 2.0, wHorizon = 2.0, wScene = 0.3
 
 // Minimum margin the winner must beat the as-scanned (0°) score by before we
 // rotate. Keeps ambiguous photos unchanged rather than guessing wrong.
@@ -124,10 +121,18 @@ func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
     // Weak-signal gate: require at least one detector to register meaningfully.
     guard best.value >= 1.5 else { return (candidates[0].0, .low) }
 
-    // When no geometry (face/body) is present, scene+horizon alone are unreliable
-    // for landscapes — require a much stronger margin before rotating.
+    // When geometry (face/body) is absent, non-geometry signals carry less
+    // certainty. Scale the required margin by how much of the weight budget
+    // is assigned to geometry vs scene/horizon, so the threshold stays
+    // sensible across any user-selected weight configuration.
     let hasGeometry = face.values.contains { $0 > 0 } || body.values.contains { $0 > 0 }
-    let effectiveMargin = hasGeometry ? rotateMargin : 2.0
+    let effectiveMargin: Double
+    if hasGeometry {
+        effectiveMargin = rotateMargin
+    } else {
+        let geomShare = (wFace + wBody) / max(wFace + wBody + wHorizon + wScene, 0.001)
+        effectiveMargin = rotateMargin + geomShare * 0.85
+    }
 
     // Ambiguity guard: keep as-scanned unless the winner clearly wins.
     if best.key != 0 && best.value <= (total[0] ?? 0) * effectiveMargin {
@@ -309,12 +314,26 @@ let dryRun = args.contains("--dry-run")
 // after the human summary, for the GUI front end to parse.
 let emitStats = args.contains("--emit-stats")
 
+// Optional weight overrides passed by the GUI (--wface 3.0 etc.).
+func argDouble(_ flag: String, _ defaultVal: Double) -> Double {
+    guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return defaultVal }
+    return Double(args[i + 1]) ?? defaultVal
+}
+wFace    = argDouble("--wface",    wFace)
+wBody    = argDouble("--wbody",    wBody)
+wHorizon = argDouble("--whorizon", wHorizon)
+wScene   = argDouble("--wscene",   wScene)
+
 guard let dirArg = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
     print("""
     Usage: correct_orientation <directory> [--dry-run]
 
-      <directory>   Folder of scanned photos to correct
-      --dry-run     Detect only, do not write changes
+      <directory>        Folder of scanned photos to correct
+      --dry-run          Detect only, do not write changes
+      --wface    <n>     Face landmark weight   (default 3.0)
+      --wbody    <n>     Body pose weight       (default 2.0)
+      --whorizon <n>     Horizon weight         (default 2.0)
+      --wscene   <n>     Scene classifier weight(default 0.3)
 
     Orientation is detected by an Apple Vision ensemble (faces, body pose,
     scene, horizon). Correction is written as an EXIF orientation tag only —
@@ -347,7 +366,10 @@ if imageURLs.isEmpty {
     exit(0)
 }
 
-print("\(dryRun ? "[DRY RUN] " : "")Processing \(imageURLs.count) image(s) in \(dirURL.path)\n")
+let weightLabel = String(format: "face %.1f · body %.1f · horizon %.1f · scene %.1f",
+                         wFace, wBody, wHorizon, wScene)
+print("\(dryRun ? "[DRY RUN] " : "")Processing \(imageURLs.count) image(s) in \(dirURL.path)")
+print("  Weights: \(weightLabel)\n")
 
 // Progress markers for the GUI (hidden from its console). The total lets the
 // front end show a determinate progress bar.
