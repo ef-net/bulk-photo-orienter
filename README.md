@@ -40,7 +40,8 @@ pass `--wface`, `--wbody`, `--whorizon`, `--wscene`.
 
 Supported formats: JPEG, TIFF. PNG orientation-tag support varies by viewer.
 
-Tested with bulk image output from the Epson FF-680W scanner.
+Tested with bulk image output from the Epson FF-680W scanner. Processed on
+MacBook Pro / M4 Max / macOS Tahoe.
 
 ## Requirements
 
