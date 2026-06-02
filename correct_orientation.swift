@@ -60,11 +60,15 @@ func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: correction.orientation)
         try? handler.perform([faceReq, bodyReq, sceneReq, horizonReq])
 
-        // FACE: confidence × cos(roll); upright faces (roll≈0) score ~1.
+        // FACE: best single face score (confidence × cos(roll)).
+        // Requires roll data and minimum confidence so partially-obscured faces,
+        // back-turned subjects, and piles of small group-shot faces don't corrupt
+        // the vote. Using max (not sum) means one good face counts once.
         if let faces = faceReq.results {
-            face[degrees] = faces.reduce(0.0) { acc, f in
-                acc + Double(f.confidence) * max(0, cos(f.roll?.doubleValue ?? 0))
-            }
+            face[degrees] = faces.compactMap { f -> Double? in
+                guard f.confidence > 0.3, let roll = f.roll else { return nil }
+                return Double(f.confidence) * max(0, cos(roll.doubleValue))
+            }.max() ?? 0
         }
 
         // BODY: reward people whose head sits above their pelvis (y is up).
@@ -111,8 +115,13 @@ func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
     // Weak-signal gate: require at least one detector to register meaningfully.
     guard best.value >= 1.5 else { return (candidates[0].0, .low) }
 
+    // When no geometry (face/body) is present, scene+horizon alone are unreliable
+    // for landscapes — require a much stronger margin before rotating.
+    let hasGeometry = face.values.contains { $0 > 0 } || body.values.contains { $0 > 0 }
+    let effectiveMargin = hasGeometry ? rotateMargin : 2.0
+
     // Ambiguity guard: keep as-scanned unless the winner clearly wins.
-    if best.key != 0 && best.value <= (total[0] ?? 0) * rotateMargin {
+    if best.key != 0 && best.value <= (total[0] ?? 0) * effectiveMargin {
         return (candidates[0].0, .low)
     }
 
