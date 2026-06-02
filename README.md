@@ -6,6 +6,14 @@ photos in a folder — **losslessly**, with no recompression or quality loss.
 Built entirely with the Swift toolchain and frameworks that ship with macOS.
 **No Xcode project, no packages, no dependencies to install.**
 
+## ⬇️ Download
+
+**[Download PhotoOrienter.app (.zip)](https://github.com/ef-net/bulk-photo-orienter/raw/master/PhotoOrienter.app.zip)** · macOS 14+
+
+Unzip, then **right-click the app → Open** the first time (it's ad-hoc signed,
+so Gatekeeper asks once). After that it opens normally. Prefer to build it
+yourself? See [Build](#build).
+
 ---
 
 ## What it does
