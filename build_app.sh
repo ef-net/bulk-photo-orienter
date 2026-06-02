@@ -8,7 +8,7 @@ cd "$(dirname "$0")"
 ROOT="$(pwd)"
 APP="PhotoOrienter.app"
 APP_NAME="Photo Orienter"
-BUNDLE_ID="net.efanelli.photoorienter"
+BUNDLE_ID="io.github.ef-net.bulk-photo-orienter"
 
 echo "▶︎ Building engine (correct_orientation)…"
 swiftc correct_orientation.swift -O \
