@@ -48,7 +48,7 @@ struct DetectorWeights {
 
     var total: Double { face + body + horizon + scene }
 
-    static let defaults = DetectorWeights(face: 3.0, body: 2.0, horizon: 2.0, scene: 0.3)
+    static let defaults = DetectorWeights(face: 4.0, body: 3.0, horizon: 0.5, scene: 2.0)
 }
 
 /// Detection tunables grouped in one place. The margins are ratios, so they are
@@ -422,10 +422,10 @@ guard let dirArg = args.dropFirst().first(where: { !$0.hasPrefix("-") }) else {
 
       <directory>        Folder of scanned photos to correct
       --dry-run          Detect only, do not write changes
-      --wface    <n>     Face landmark weight    (default 3.0)
-      --wbody    <n>     Body pose weight        (default 2.0)
-      --whorizon <n>     Horizon weight          (default 2.0)
-      --wscene   <n>     Scene classifier weight (default 0.3)
+      --wface    <n>     Face landmark weight    (default 4.0)
+      --wbody    <n>     Body pose weight        (default 3.0)
+      --whorizon <n>     Horizon weight          (default 0.5)
+      --wscene   <n>     Scene classifier weight (default 2.0)
 
     Orientation is detected by an Apple Vision ensemble (faces, body pose,
     scene, horizon). Correction is written as an EXIF orientation tag only —

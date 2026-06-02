@@ -20,8 +20,8 @@ struct WeightPreset: Identifiable, Equatable {
     static let all: [WeightPreset] = [
         WeightPreset(
             id: "default", name: "Default",
-            description: "Face geometry is the primary signal. Best for mixed photo collections with people.",
-            face: 3.0, body: 2.0, horizon: 2.0, scene: 0.3
+            description: "Face and body geometry lead, with scene classification as strong support. Best all-round setting for mixed photo collections.",
+            face: 4.0, body: 3.0, horizon: 0.5, scene: 2.0
         ),
         WeightPreset(
             id: "scene", name: "Scene-first",
