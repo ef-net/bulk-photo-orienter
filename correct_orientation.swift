@@ -34,7 +34,11 @@ private let candidates: [(Correction, Int)] = [
 ]
 
 // Detector weights (relative trust). Geometry > scene/horizon.
-private let wFace = 3.0, wBody = 2.0, wScene = 1.0, wHorizon = 0.5
+// Horizon is physics-based (gravity/level-line detection) and directly
+// measures orientation — weighted higher than the scene classifier, which
+// is a semantic model trained on upright images and is unreliable for
+// orientation decisions on landscapes, groups, and ambiguous content.
+private let wFace = 3.0, wBody = 2.0, wHorizon = 2.0, wScene = 0.3
 
 // Minimum margin the winner must beat the as-scanned (0°) score by before we
 // rotate. Keeps ambiguous photos unchanged rather than guessing wrong.
@@ -67,6 +71,11 @@ func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
         if let faces = faceReq.results {
             face[degrees] = faces.compactMap { f -> Double? in
                 guard f.confidence > 0.3, let roll = f.roll else { return nil }
+                // Ignore tiny faces (wide-angle group shots, background faces).
+                // Bounding box is normalised [0,1]; 0.5% of image area filters
+                // faces smaller than ~1/15th of image width on a side.
+                let area = f.boundingBox.width * f.boundingBox.height
+                guard area > 0.005 else { return nil }
                 return Double(f.confidence) * max(0, cos(roll.doubleValue))
             }.max() ?? 0
         }
