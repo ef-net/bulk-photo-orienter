@@ -7,14 +7,15 @@ import UniformTypeIdentifiers
 /// One line of console output, with a semantic style for colouring.
 struct LogLine: Identifiable {
     let id = UUID()
-    let text: String
+    let text: String           // ANSI-stripped; used for the log file
     let kind: Kind
+    let attributed: AttributedString  // inline-coloured; used for display
 
     enum Kind {
         case normal, success, warning, failure, rotate, header, info
     }
 
-    var color: Color {
+    static func color(for kind: Kind) -> Color {
         switch kind {
         case .normal:  return Color(white: 0.85)
         case .success: return Color(red: 0.40, green: 0.85, blue: 0.45)
@@ -26,6 +27,8 @@ struct LogLine: Identifiable {
         }
     }
 
+    var color: Color { LogLine.color(for: kind) }
+
     static func classify(_ line: String) -> Kind {
         if line.contains("✓") { return .success }
         if line.contains("✗") { return .failure }
@@ -34,6 +37,60 @@ struct LogLine: Identifiable {
         if line.contains("SUMMARY") || line.contains("────") { return .header }
         if line.hasPrefix("[DRY RUN]") || line.hasPrefix("Processing") { return .info }
         return .normal
+    }
+
+    /// Build a LogLine from a raw string that may contain ANSI colour codes.
+    static func make(_ raw: String) -> LogLine {
+        let plain = stripANSI(raw)
+        let kind = classify(plain)
+        let attributed = buildAttributed(raw, defaultColor: color(for: kind))
+        return LogLine(text: plain, kind: kind, attributed: attributed)
+    }
+
+    // Strip ESC[Xm sequences, leaving only printable text.
+    private static func stripANSI(_ s: String) -> String {
+        var out = "", i = s.startIndex
+        while i < s.endIndex {
+            if s[i] == "\u{001B}", s.index(after: i) < s.endIndex, s[s.index(after: i)] == "[" {
+                var j = s.index(i, offsetBy: 2)
+                while j < s.endIndex && s[j] != "m" { j = s.index(after: j) }
+                if j < s.endIndex { i = s.index(after: j); continue }
+            }
+            out.append(s[i]); i = s.index(after: i)
+        }
+        return out
+    }
+
+    // Build an AttributedString, mapping ANSI colour codes to SwiftUI Colors.
+    // Non-coloured segments use `defaultColor` (the line's semantic kind colour).
+    private static func buildAttributed(_ raw: String, defaultColor: Color) -> AttributedString {
+        let ansiGreen  = Color(red: 0.40, green: 0.85, blue: 0.45)
+        let ansiYellow = Color(red: 0.95, green: 0.78, blue: 0.30)
+        var result = AttributedString()
+        var current = defaultColor
+        var i = raw.startIndex
+        while i < raw.endIndex {
+            if raw[i] == "\u{001B}", raw.index(after: i) < raw.endIndex, raw[raw.index(after: i)] == "[" {
+                var j = raw.index(i, offsetBy: 2)
+                while j < raw.endIndex && raw[j] != "m" { j = raw.index(after: j) }
+                if j < raw.endIndex {
+                    let code = Int(raw[raw.index(i, offsetBy: 2)..<j]) ?? 0
+                    switch code {
+                    case 32: current = ansiGreen
+                    case 33: current = ansiYellow
+                    default: current = defaultColor
+                    }
+                    i = raw.index(after: j); continue
+                }
+            }
+            var j = i
+            while j < raw.endIndex && raw[j] != "\u{001B}" { j = raw.index(after: j) }
+            var seg = AttributedString(String(raw[i..<j]))
+            seg.foregroundColor = current
+            result += seg
+            i = j
+        }
+        return result
     }
 }
 
@@ -201,13 +258,15 @@ final class Runner: ObservableObject {
             done = Int(line.dropFirst("@@PROGRESS ".count).trimmingCharacters(in: .whitespaces)) ?? done
             return
         }
-        rawLog += line + "\n"
-        lines.append(LogLine(text: line, kind: LogLine.classify(line)))
+        let logLine = LogLine.make(line)
+        rawLog += logLine.text + "\n"
+        lines.append(logLine)
     }
 
     private func append(_ text: String, flush: Bool) {
-        rawLog += text + "\n"
-        lines.append(LogLine(text: text, kind: LogLine.classify(text)))
+        let logLine = LogLine.make(text)
+        rawLog += logLine.text + "\n"
+        lines.append(logLine)
     }
 
     private func finish() {
@@ -382,9 +441,8 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
                     ForEach(runner.lines) { line in
-                        Text(line.text.isEmpty ? " " : line.text)
+                        Text(line.text.isEmpty ? AttributedString(" ") : line.attributed)
                             .font(.system(size: 11.5, design: .monospaced))
-                            .foregroundStyle(line.color)
                             .textSelection(.enabled)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .id(line.id)
