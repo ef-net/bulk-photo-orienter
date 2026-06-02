@@ -1,0 +1,27 @@
+# --- Build artifacts (regenerate with ./build_app.sh) ---
+PhotoOrienter.app/
+# compiled engine binary (rebuild with ./build_app.sh)
+correct_orientation
+*.o
+*.icns
+icon_master.png
+
+# --- Test data / scratch (never commit large media) ---
+Test Data/
+photos/
+photo2/
+*.jpg
+*.jpeg
+*.png
+*.tiff
+*.tif
+*.heic
+
+# --- macOS / editor cruft ---
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# --- Local tooling / settings ---
+.claude/
