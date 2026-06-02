@@ -13,10 +13,11 @@ macOS; no other dependencies.
 > The app is ad-hoc signed, not notarized, so a downloaded copy is blocked by
 > Gatekeeper on first launch.
 >
-> After the block message appears:
+> First launch:
 >
-> 1. Open System Settings → Privacy & Security
-> 2. Click Open Anyway
+> 1. Double click downloaded app, when error appears → click Done
+> 2. Open System Settings → Privacy & Security → click Open Anyway
+> 3. Click Open Anyway → authenticate (as needed)
 
 ## Detection
 
