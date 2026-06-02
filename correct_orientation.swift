@@ -24,6 +24,8 @@ struct Correction {
     let label: String
 }
 
+enum Confidence { case low, high }
+
 private let candidates: [(Correction, Int)] = [
     (Correction(orientation: .up,    label: "0° (already upright)"), 0),
     (Correction(orientation: .right, label: "90° clockwise"),        90),
@@ -36,9 +38,13 @@ private let wFace = 3.0, wBody = 2.0, wScene = 1.0, wHorizon = 0.5
 
 // Minimum margin the winner must beat the as-scanned (0°) score by before we
 // rotate. Keeps ambiguous photos unchanged rather than guessing wrong.
-private let rotateMargin = 1.08
+private let rotateMargin = 1.15
 
-func detectCorrection(for cgImage: CGImage) -> Correction? {
+private let ansiGreen  = "\u{001B}[32m"
+private let ansiYellow = "\u{001B}[33m"
+private let ansiReset  = "\u{001B}[0m"
+
+func detectCorrection(for cgImage: CGImage) -> (Correction, Confidence)? {
     var face = [Int: Double]()
     var body = [Int: Double]()
     var scene = [Int: Double]()
@@ -102,12 +108,26 @@ func detectCorrection(for cgImage: CGImage) -> Correction? {
         return nil  // nothing detected at all
     }
 
+    // Weak-signal gate: require at least one detector to register meaningfully.
+    guard best.value >= 1.5 else { return (candidates[0].0, .low) }
+
     // Ambiguity guard: keep as-scanned unless the winner clearly wins.
     if best.key != 0 && best.value <= (total[0] ?? 0) * rotateMargin {
-        return candidates[0].0
+        return (candidates[0].0, .low)
     }
 
-    return candidates.first { $0.1 == best.key }!.0
+    // Direction guard: winner must clearly beat the next-best rotation so we
+    // don't flip to a wrong direction when two rotations are nearly tied.
+    if best.key != 0 {
+        let competingMax = total.filter { $0.key != best.key && $0.key != 0 }.values.max() ?? 0
+        if competingMax > 0 && best.value <= competingMax * 1.10 {
+            return (candidates[0].0, .low)
+        }
+    }
+
+    let secondBest = total.filter { $0.key != best.key }.values.max() ?? 0
+    let confidence: Confidence = secondBest > 0 && best.value / secondBest >= 2.0 ? .high : .low
+    return (candidates.first { $0.1 == best.key }!.0, confidence)
 }
 
 // MARK: - Orientation Metadata (lossless)
@@ -225,17 +245,21 @@ func processImage(at url: URL, dryRun: Bool) -> ProcessResult {
     print("  Analysing \(url.lastPathComponent)…", terminator: "")
     fflush(stdout)
 
-    guard let correction = detectCorrection(for: cgImage) else {
+    guard let (correction, confidence) = detectCorrection(for: cgImage) else {
         print(" inconclusive — left unchanged")
         return .inconclusive
     }
 
+    let confidenceTag = confidence == .high
+        ? " \(ansiGreen)[high confidence]\(ansiReset)"
+        : " \(ansiYellow)[low confidence]\(ansiReset)"
+
     guard correction.orientation != .up else {
-        print(" already upright")
+        print(" already upright\(confidenceTag)")
         return .upright
     }
 
-    print(" rotating \(correction.label)")
+    print(" rotating \(correction.label)\(confidenceTag)")
 
     // Map the correction to its statistic category.
     let rotationResult: ProcessResult
