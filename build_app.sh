@@ -69,5 +69,11 @@ PLIST
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || \
     echo "  (codesign skipped — app will still run locally)"
 
+# Package the bundle into the zip that the README links for download.
+echo "▶︎ Zipping $APP → $APP.zip…"
+rm -f "$APP.zip"
+ditto -c -k --keepParent "$APP" "$APP.zip"
+
 echo "✓ Built $ROOT/$APP"
 echo "  Launch with:  open \"$ROOT/$APP\""
+echo "  Download zip: $ROOT/$APP.zip ($(du -h "$APP.zip" | cut -f1))"
